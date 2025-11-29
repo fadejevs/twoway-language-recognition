@@ -1,7 +1,3 @@
-"""
-WebSocket handlers for two-way language recognition
-Handles real-time speech recognition and translation
-"""
 import logging
 import base64
 import tempfile
