@@ -1,136 +1,124 @@
 'use strict';
+
 const sdk = require('microsoft-cognitiveservices-speech-sdk');
-const fetch = require('node-fetch');
 const { log } = require('./logger');
 
+function normalizeLangs(input, fallback0 = 'en-US', fallback1 = 'lv-LV') {
+  let langs = [];
+
+  if (Array.isArray(input)) langs = input;
+  else if (typeof input === 'string') langs = input.split(',');
+  else langs = [fallback0, fallback1];
+
+  langs = langs
+    .map((s) => String(s || '').trim())
+    .filter(Boolean)
+    .map((s) => s.replace(/_/g, '-'));
+
+  langs = [...new Set(langs)];
+
+  const re = /^[A-Za-z]{2,3}-[A-Za-z]{2}$/;
+  langs = langs.filter((l) => re.test(l));
+
+  if (langs.length === 0) langs = [fallback0];
+  return langs.slice(0, 10);
+}
+
 class RecognizerWrapper {
-  constructor({ key, region, lang0, lang1, rate, postUrl, eventId, controller }) {
+  constructor({ key, region, langs, rate, controller, endpointMode }) {
     this.key = key;
     this.region = region;
-    this.lang0 = lang0 || 'en-US';
-    this.lang1 = lang1 || 'lv-LV';
-    this.rate = rate;
-    this.postUrl = postUrl;
-    this.eventId = eventId;
+
+    this.langs = normalizeLangs(langs);
+    this.rate = rate || 16000;
     this.controller = controller;
 
-    this.pushStream = null;
+    this.endpointMode = endpointMode || 'conversation'; // conversation|dictation
+
     this.recognizer = null;
+    this.pushStream = null;
     this.reconnects = 0;
-    this.lastResults = [];
+
+    this.sessionStart = process.hrtime.bigint();
+    this.currentUtteranceStart = null;
   }
 
   start() {
     const fmt = sdk.AudioStreamFormat.getWaveFormatPCM(this.rate, 16, 1);
     this.pushStream = sdk.AudioInputStream.createPushStream(fmt);
+
     this.controller.attachStream(this.pushStream);
 
-    const audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
-    const speechConfig = sdk.SpeechConfig.fromSubscription(this.key, this.region);
+    const endpointKind = this.endpointMode === 'dictation' ? 'dictation' : 'conversation';
+    const endpoint = new URL(
+      `wss://${this.region}.stt.speech.microsoft.com/speech/recognition/${endpointKind}/cognitiveservices/v1`
+    );
 
-    // Set up for multi-language detection
-    speechConfig.outputFormat = sdk.OutputFormat.Detailed;
-    speechConfig.setProperty(sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs, "500");
-    
-    // Create source language config with OPEN_RANGE for at-start detection
-    // const autoDetectSourceLanguageConfig = sdk.AutoDetectSourceLanguageConfig.fromOpenRange();
-    
-    // Alternative: specify candidate languages explicitly
-    const autoDetectSourceLanguageConfig = sdk.AutoDetectSourceLanguageConfig.fromLanguages([
-      this.lang0,
-      this.lang1
-    ]);
+    const speechConfig = sdk.SpeechConfig.fromEndpoint(endpoint, this.key);
+
+    speechConfig.setProperty(
+      sdk.PropertyId.SpeechServiceConnection_LanguageIdMode,
+      'Continuous'
+    );
+
+    speechConfig.setProperty(
+      sdk.PropertyId.SpeechServiceResponse_StablePartialResultThreshold,
+      '2'
+    );
+
+    speechConfig.setProperty(
+      sdk.PropertyId.Speech_SegmentationSilenceTimeoutMs,
+      '1200'
+    );
+
+    const audioConfig = sdk.AudioConfig.fromStreamInput(this.pushStream);
+    const autoDetect = sdk.AutoDetectSourceLanguageConfig.fromLanguages(this.langs);
 
     this.recognizer = sdk.SpeechRecognizer.FromConfig(
       speechConfig,
-      autoDetectSourceLanguageConfig,
+      autoDetect,
       audioConfig
     );
 
     this._setupRecognizer();
 
-    log(`[asr] started recognizer with open-range language detection`);
-  }
-
-  _getConfidence(result) {
-    try {
-      const detailed = result.properties.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult);
-      if (detailed) {
-        const json = JSON.parse(detailed);
-        return json.NBest?.[0]?.Confidence || 0;
-      }
-    } catch (e) {
-      log('[asr] confidence parse error:', e.message);
-    }
-    return 0;
-  }
-
-  _getDetectedLanguage(result) {
-    try {
-      // Try to get language from auto-detect result
-      const langProperty = result.properties.getProperty(sdk.PropertyId.SpeechServiceConnection_AutoDetectSourceLanguageResult);
-      if (langProperty) {
-        return langProperty;
-      }
-      
-      // Fallback: parse from JSON result
-      const detailed = result.properties.getProperty(sdk.PropertyId.SpeechServiceResponse_JsonResult);
-      if (detailed) {
-        const json = JSON.parse(detailed);
-        return json.Language || 'unknown';
-      }
-    } catch (e) {
-      log('[asr] language detection parse error:', e.message);
-    }
-    return 'unknown';
-  }
-
-  _isDuplicate(text, lang, timestamp) {
-    const now = timestamp || Date.now();
-    this.lastResults = this.lastResults.filter(r => now - r.timestamp < 2000);
-    
-    const isDupe = this.lastResults.some(r => 
-      r.text === text && Math.abs(now - r.timestamp) < 2000
-    );
-    
-    if (!isDupe) {
-      this.lastResults.push({ text, lang, timestamp: now });
-    }
-    
-    return isDupe;
+    log(`[asr] started (langs=${this.langs.join(',')}, LID=Continuous, ep=${endpointKind})`);
   }
 
   _setupRecognizer() {
     this.recognizer.recognizing = (_, e) => {
-      if (e?.result?.text) {
-        const detectedLang = this._getDetectedLanguage(e.result);
-        log(`[asr-${detectedLang}] partial: "${e.result.text}"`);
-      }
+      const text = e?.result?.text;
+      if (!text) return;
+
+      if (!this.currentUtteranceStart) this.currentUtteranceStart = process.hrtime.bigint();
+
+      log(`[asr~] ${text}`);
     };
 
-    this.recognizer.recognized = async (_, e) => {
-      if (e?.result?.text && e.result.reason === sdk.ResultReason.RecognizedSpeech) {
-        const detectedLang = this._getDetectedLanguage(e.result);
-        const confidence = this._getConfidence(e.result);
-        const text = e.result.text;
-        
-        log(`[asr-${detectedLang}] recognized (conf: ${confidence.toFixed(2)}): "${text}"`);
-        
-        if (this._isDuplicate(text, detectedLang)) {
-          log(`[asr-${detectedLang}] duplicate detected: "${text}"`);
-        }
-        
-        await this.postToApp(text, detectedLang, confidence);
-      } else if (e?.result?.reason === sdk.ResultReason.NoMatch) {
-        log('[asr] no match - speech detected but not recognized');
-      }
+    this.recognizer.recognized = (_, e) => {
+      const text = e?.result?.text;
+      if (!text) return;
+      if (e.result.reason !== sdk.ResultReason.RecognizedSpeech) return;
+
+      let lang = 'unknown';
+      try {
+        const lid = sdk.AutoDetectSourceLanguageResult.fromResult(e.result);
+        if (lid?.language) lang = lid.language;
+      } catch {}
+
+      const now = process.hrtime.bigint();
+      const latencyMs = this.currentUtteranceStart
+        ? Number(now - this.currentUtteranceStart) / 1e6
+        : 0;
+
+      this.currentUtteranceStart = null;
+
+      log(`[asr-${lang}] ${text} (latency ${(latencyMs / 1000).toFixed(2)}s)`);
     };
 
     this.recognizer.canceled = (_, e) => {
-      log('[asr] canceled:', e.reason, e.errorDetails);
-      if (e.reason === sdk.CancellationReason.Error) {
-        this.reconnect();
-      }
+      log(`[asr] canceled: ${e?.reason ?? ''} ${e?.errorDetails ?? ''}`.trim());
+      this.reconnect();
     };
 
     this.recognizer.sessionStopped = () => {
@@ -139,52 +127,31 @@ class RecognizerWrapper {
     };
 
     this.recognizer.startContinuousRecognitionAsync(
-      () => log('[asr] continuous recognition started'),
+      () => {
+        const now = process.hrtime.bigint();
+        const delayMs = Number(now - this.sessionStart) / 1e6;
+        log(`[asr] recognition started (delay ${(delayMs / 1000).toFixed(2)}s)`);
+      },
       (err) => {
-        log('[asr] start error:', err);
+        log(`[asr] start error: ${err?.message || err}`);
         this.reconnect();
       }
     );
   }
 
-  async postToApp(text, lang, confidence) {
-    try {
-      await fetch(this.postUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          room_id: this.eventId, 
-          text, 
-          lang,
-          confidence: confidence || 0
-        })
-      });
-      log(`[post] sent to app: ${text.substring(0, 50)}... (${lang}, conf: ${(confidence || 0).toFixed(2)})`);
-    } catch (e) {
-      log('[post] error:', e.message);
-    }
-  }
-
   reconnect() {
     this.stop();
     const delay = Math.min(15000, 1000 * Math.pow(2, this.reconnects++));
-    log(`[asr] reconnecting in ${delay}ms (attempt ${this.reconnects})`);
+    log(`[asr] reconnecting in ${delay}ms`);
     setTimeout(() => this.start(), delay);
   }
 
   stop() {
-    try {
-      this.recognizer?.stopContinuousRecognitionAsync(() => {
-        log('[asr] stopped successfully');
-      }, (err) => {
-        log('[asr] stop error:', err);
-      });
-    } catch (e) {
-      log('[asr] exception during stop:', e.message);
-    }
+    try { this.recognizer?.stopContinuousRecognitionAsync(() => {}, () => {}); } catch {}
     try { this.pushStream?.close(); } catch {}
     this.recognizer = null;
     this.pushStream = null;
+    this.currentUtteranceStart = null;
   }
 }
 
